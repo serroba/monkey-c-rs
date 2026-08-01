@@ -3,8 +3,11 @@
 //!
 //! The server keeps the full text of every open document in memory (full-sync)
 //! and re-analyses on open/change, publishing diagnostics. It answers
-//! `textDocument/formatting` by re-rendering through the formatter and
-//! `textDocument/codeAction` with the linter's fixes.
+//! `textDocument/formatting` by re-rendering through the formatter,
+//! `textDocument/codeAction` with the linter's fixes, and
+//! `textDocument/definition` by resolving names against every source in the
+//! workspace — which it reads from disk at startup, since navigation has to
+//! reach files the editor never opened.
 
 // `gen_lsp_types::Uri` carries an internal lazy-parse cache (interior
 // mutability) that doesn't affect its `Hash`/`Eq`, so it is a safe `HashMap`
@@ -12,27 +15,31 @@
 #![allow(clippy::mutable_key_type)]
 
 mod analysis;
+mod definition;
 mod position;
+mod symbols;
+mod uri;
+mod workspace;
 
 use std::collections::HashMap;
 use std::error::Error;
+use std::path::PathBuf;
 
 use gen_lsp_types::{
     CodeAction, CodeActionKind, CodeActionOptions, CodeActionParams, CodeActionProvider,
-    CodeActionRequest, CodeActionResponse, Diagnostic, DidChangeTextDocumentNotification,
-    DidCloseTextDocumentNotification, DidCloseTextDocumentParams, DidOpenTextDocumentNotification,
-    DocumentFormattingParams, DocumentFormattingProvider, DocumentFormattingRequest,
-    LspNotificationMethod, LspRequestMethod, Notification as _, Position,
-    PublishDiagnosticsNotification, PublishDiagnosticsParams, Range, Request as _,
-    ServerCapabilities, TextDocumentContentChangeEvent, TextDocumentSync, TextDocumentSyncKind,
-    TextEdit, Uri, WorkspaceEdit,
+    CodeActionRequest, CodeActionResponse, DefinitionParams, DefinitionProvider, DefinitionRequest,
+    Diagnostic, DidChangeTextDocumentNotification, DidCloseTextDocumentNotification,
+    DidCloseTextDocumentParams, DidOpenTextDocumentNotification, DocumentFormattingParams,
+    DocumentFormattingProvider, DocumentFormattingRequest, Location, LspNotificationMethod,
+    LspRequestMethod, Notification as _, Position, PublishDiagnosticsNotification,
+    PublishDiagnosticsParams, Range, Request as _, ServerCapabilities,
+    TextDocumentContentChangeEvent, TextDocumentSync, TextDocumentSyncKind, TextEdit, Uri,
+    WorkspaceEdit,
 };
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 
 use crate::position::PositionMapper;
-
-/// Open documents keyed by URI, holding their current full text.
-type Documents = HashMap<Uri, String>;
+use crate::workspace::Workspace;
 
 fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     let (connection, io_threads) = Connection::stdio();
@@ -40,6 +47,7 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     let capabilities = serde_json::to_value(ServerCapabilities {
         text_document_sync: Some(TextDocumentSync::Kind(TextDocumentSyncKind::Full)),
         document_formatting_provider: Some(DocumentFormattingProvider::Bool(true)),
+        definition_provider: Some(DefinitionProvider::Bool(true)),
         code_action_provider: Some(CodeActionProvider::CodeActionOptions(CodeActionOptions {
             code_action_kinds: Some(vec![CodeActionKind::QuickFix, CodeActionKind::SourceFixAll]),
             ..Default::default()
@@ -47,8 +55,14 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
         ..Default::default()
     })?;
 
-    let _init_params = connection.initialize(capabilities)?;
-    run(&connection)?;
+    let init_params = connection.initialize(capabilities)?;
+
+    let mut workspace = Workspace::default();
+    for root in roots(&init_params) {
+        workspace.load_root(&root);
+    }
+
+    run(&connection, workspace)?;
 
     // `connection` must be dropped before joining: its `sender` keeps the writer
     // thread's channel open, so `join` would otherwise block forever.
@@ -58,9 +72,34 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     Ok(())
 }
 
-fn run(connection: &Connection) -> Result<(), Box<dyn Error + Sync + Send>> {
-    let mut documents = Documents::new();
+/// The directories the client asked the server to work in. Modern clients send `workspaceFolders`
+/// and older ones only `rootUri`, so both spellings are read.
+fn roots(init_params: &serde_json::Value) -> Vec<PathBuf> {
+    let folders: Vec<_> = init_params
+        .get("workspaceFolders")
+        .and_then(serde_json::Value::as_array)
+        .map(|folders| folders.iter().filter_map(|f| f.get("uri")).collect())
+        .unwrap_or_default();
 
+    if !folders.is_empty() {
+        return folders.into_iter().filter_map(root_path).collect();
+    }
+
+    init_params
+        .get("rootUri")
+        .and_then(root_path)
+        .into_iter()
+        .collect()
+}
+
+fn root_path(value: &serde_json::Value) -> Option<PathBuf> {
+    uri::to_path(&Uri(value.as_str()?.to_string()))
+}
+
+fn run(
+    connection: &Connection,
+    mut workspace: Workspace,
+) -> Result<(), Box<dyn Error + Sync + Send>> {
     for message in &connection.receiver {
         match message {
             Message::Request(request) => {
@@ -68,10 +107,10 @@ fn run(connection: &Connection) -> Result<(), Box<dyn Error + Sync + Send>> {
                     return Ok(());
                 }
 
-                handle_request(connection, &documents, request)?;
+                handle_request(connection, &workspace, request)?;
             }
             Message::Notification(notification) => {
-                handle_notification(connection, &mut documents, notification)?;
+                handle_notification(connection, &mut workspace, notification)?;
             }
             Message::Response(_) => {}
         }
@@ -82,7 +121,7 @@ fn run(connection: &Connection) -> Result<(), Box<dyn Error + Sync + Send>> {
 
 fn handle_request(
     connection: &Connection,
-    documents: &Documents,
+    workspace: &Workspace,
     request: Request,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
     let id = request.id.clone();
@@ -90,12 +129,16 @@ fn handle_request(
 
     if method == DocumentFormattingRequest::METHOD {
         let params: DocumentFormattingParams = serde_json::from_value(request.params)?;
-        let edits = format(documents, &params);
+        let edits = format(workspace, &params);
         respond(connection, id, serde_json::to_value(edits)?)?;
     } else if method == CodeActionRequest::METHOD {
         let params: CodeActionParams = serde_json::from_value(request.params)?;
-        let actions = code_actions(documents, &params);
+        let actions = code_actions(workspace, &params);
         respond(connection, id, serde_json::to_value(actions)?)?;
+    } else if method == DefinitionRequest::METHOD {
+        let params: DefinitionParams = serde_json::from_value(request.params)?;
+        let locations = definitions(workspace, &params);
+        respond(connection, id, serde_json::to_value(locations)?)?;
     } else {
         // Unknown request: reply with an empty success so the client isn't left
         // waiting. Specific method handling is added above.
@@ -107,7 +150,7 @@ fn handle_request(
 
 fn handle_notification(
     connection: &Connection,
-    documents: &mut Documents,
+    workspace: &mut Workspace,
     notification: Notification,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
     let method = LspNotificationMethod::from(notification.method.as_str());
@@ -116,20 +159,27 @@ fn handle_notification(
         let params: gen_lsp_types::DidOpenTextDocumentParams =
             serde_json::from_value(notification.params)?;
         let uri = params.text_document.uri;
-        documents.insert(uri.clone(), params.text_document.text);
-        publish(connection, documents, &uri)?;
+        if let Some(path) = uri::to_path(&uri) {
+            workspace.set(path, params.text_document.text);
+            publish(connection, workspace, &uri)?;
+        }
     } else if method == DidChangeTextDocumentNotification::METHOD {
         let params: gen_lsp_types::DidChangeTextDocumentParams =
             serde_json::from_value(notification.params)?;
         // Full sync: the last change carries the whole new text.
         if let Some(change) = params.content_changes.into_iter().next_back() {
             let uri = params.text_document.text_document_identifier.uri;
-            documents.insert(uri.clone(), content_change_text(change));
-            publish(connection, documents, &uri)?;
+            if let Some(path) = uri::to_path(&uri) {
+                workspace.set(path, content_change_text(change));
+                publish(connection, workspace, &uri)?;
+            }
         }
     } else if method == DidCloseTextDocumentNotification::METHOD {
         let params: DidCloseTextDocumentParams = serde_json::from_value(notification.params)?;
-        documents.remove(&params.text_document.uri);
+        if let Some(path) = uri::to_path(&params.text_document.uri) {
+            workspace.close(&path);
+        }
+
         // Clear diagnostics for the now-closed document.
         send_diagnostics(connection, params.text_document.uri, Vec::new())?;
     }
@@ -149,15 +199,35 @@ fn content_change_text(change: TextDocumentContentChangeEvent) -> String {
 /// Analyse the document at `uri` and publish its diagnostics.
 fn publish(
     connection: &Connection,
-    documents: &Documents,
+    workspace: &Workspace,
     uri: &Uri,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
-    let Some(text) = documents.get(uri) else {
+    let Some(path) = uri::to_path(uri) else {
+        return Ok(());
+    };
+
+    let Some(text) = workspace.text(&path) else {
         return Ok(());
     };
 
     let diagnostics = analysis::diagnostics(text);
     send_diagnostics(connection, uri.clone(), diagnostics)
+}
+
+/// The declarations the caret in `params` refers to.
+fn definitions(workspace: &Workspace, params: &DefinitionParams) -> Vec<Location> {
+    let position = &params.text_document_position_params;
+    let Some(path) = uri::to_path(&position.text_document.uri) else {
+        return Vec::new();
+    };
+
+    let Some(text) = workspace.text(&path) else {
+        return Vec::new();
+    };
+
+    let offset = PositionMapper::new(text).offset(position.position);
+
+    definition::definition(workspace, &path, offset)
 }
 
 fn send_diagnostics(
@@ -181,9 +251,12 @@ fn send_diagnostics(
 /// The formatting edits for a document: a single edit replacing the whole
 /// document with its formatted text. Returns no edits when the document is
 /// unknown, doesn't parse, or is already formatted.
-fn format(documents: &Documents, params: &DocumentFormattingParams) -> Vec<TextEdit> {
-    let uri = &params.text_document.uri;
-    let Some(text) = documents.get(uri) else {
+fn format(workspace: &Workspace, params: &DocumentFormattingParams) -> Vec<TextEdit> {
+    let Some(path) = uri::to_path(&params.text_document.uri) else {
+        return Vec::new();
+    };
+
+    let Some(text) = workspace.text(&path) else {
         return Vec::new();
     };
 
@@ -191,7 +264,7 @@ fn format(documents: &Documents, params: &DocumentFormattingParams) -> Vec<TextE
         return Vec::new();
     };
 
-    if formatted == *text {
+    if formatted == text {
         return Vec::new();
     }
 
@@ -212,9 +285,13 @@ fn format(documents: &Documents, params: &DocumentFormattingParams) -> Vec<TextE
 ///   each carrying just that finding's fix and the diagnostic it resolves; and
 /// - a single `source.fixAll` action bundling every fixable finding, which an
 ///   editor can run on save to apply all lint fixes at once.
-fn code_actions(documents: &Documents, params: &CodeActionParams) -> Vec<CodeActionResponse> {
+fn code_actions(workspace: &Workspace, params: &CodeActionParams) -> Vec<CodeActionResponse> {
     let uri = &params.text_document.uri;
-    let Some(text) = documents.get(uri) else {
+    let Some(path) = uri::to_path(uri) else {
+        return Vec::new();
+    };
+
+    let Some(text) = workspace.text(&path) else {
         return Vec::new();
     };
 

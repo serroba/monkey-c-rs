@@ -61,10 +61,6 @@ impl<'a> PositionMapper<'a> {
     /// Convert an LSP [`Position`] back into a byte offset. A `character` past the end of its line
     /// clamps to the line's end; a `line` past the end of the document clamps to the document's
     /// end.
-    ///
-    /// Not yet used by a request handler — kept for the client-supplied ranges that code actions
-    /// and range formatting will need.
-    #[allow(dead_code)]
     pub fn offset(&self, position: Position) -> usize {
         let Some(&line_start) = self.line_starts.get(position.line as usize) else {
             return self.source.len();
