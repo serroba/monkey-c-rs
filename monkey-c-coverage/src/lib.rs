@@ -137,6 +137,58 @@ pub fn parse_hits(log: &str) -> HashSet<usize> {
         .collect()
 }
 
+/// Render sites and their hits as a Cobertura XML report, the format coverage
+/// consumers (GitHub code quality, IDE plugins, codecov) ingest. Function
+/// granularity is expressed in Cobertura's line vocabulary: each function
+/// contributes exactly one `<line>` at its body's opening brace, with `hits`
+/// 0 or 1, so "line coverage" reads as "functions executed".
+pub fn cobertura_report(sites: &[FunctionSite], hits: &HashSet<usize>) -> String {
+    let mut by_file: std::collections::BTreeMap<&str, Vec<&FunctionSite>> =
+        std::collections::BTreeMap::new();
+    for site in sites {
+        by_file.entry(&site.file).or_default().push(site);
+    }
+
+    let total = sites.len().max(1);
+    let covered = sites.iter().filter(|s| hits.contains(&s.id)).count();
+    let mut xml = String::new();
+    xml.push_str("<?xml version=\"1.0\"?>\n");
+    xml.push_str(&format!(
+        "<coverage line-rate=\"{:.4}\" lines-valid=\"{}\" lines-covered=\"{}\" version=\"monkey-c-coverage\" timestamp=\"0\">\n",
+        covered as f64 / total as f64,
+        sites.len(),
+        covered
+    ));
+    xml.push_str("  <packages>\n    <package name=\"monkey-c\">\n      <classes>\n");
+    for (file, file_sites) in &by_file {
+        let file_covered = file_sites.iter().filter(|s| hits.contains(&s.id)).count();
+        xml.push_str(&format!(
+            "        <class name=\"{}\" filename=\"{}\" line-rate=\"{:.4}\">\n          <methods/>\n          <lines>\n",
+            xml_escape(file),
+            xml_escape(file),
+            file_covered as f64 / file_sites.len().max(1) as f64
+        ));
+        for site in file_sites {
+            xml.push_str(&format!(
+                "            <line number=\"{}\" hits=\"{}\"/>\n",
+                site.line,
+                u8::from(hits.contains(&site.id))
+            ));
+        }
+        xml.push_str("          </lines>\n        </class>\n");
+    }
+    xml.push_str("      </classes>\n    </package>\n  </packages>\n</coverage>\n");
+    xml
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 struct FunctionBody {
     brace: usize,
     name: String,
@@ -275,5 +327,41 @@ COVHIT 11
         // naming rules, so the generated runtime must not reintroduce `_hits`.
         assert!(runtime.contains("var hits"));
         assert!(!runtime.contains("_hits"));
+    }
+
+    #[test]
+    fn cobertura_marks_functions_as_single_lines() {
+        let sites = vec![
+            FunctionSite {
+                id: 0,
+                file: "source/a.mc".into(),
+                name: "M.hit".into(),
+                line: 3,
+            },
+            FunctionSite {
+                id: 1,
+                file: "source/a.mc".into(),
+                name: "M.missed".into(),
+                line: 9,
+            },
+        ];
+        let xml = cobertura_report(&sites, &HashSet::from([0]));
+        assert!(xml.contains("lines-valid=\"2\" lines-covered=\"1\""));
+        assert!(xml.contains("line-rate=\"0.5000\""));
+        assert!(xml.contains("filename=\"source/a.mc\""));
+        assert!(xml.contains("<line number=\"3\" hits=\"1\"/>"));
+        assert!(xml.contains("<line number=\"9\" hits=\"0\"/>"));
+    }
+
+    #[test]
+    fn cobertura_escapes_xml_significant_characters() {
+        let sites = vec![FunctionSite {
+            id: 0,
+            file: "a&b.mc".into(),
+            name: "f".into(),
+            line: 1,
+        }];
+        let xml = cobertura_report(&sites, &HashSet::new());
+        assert!(xml.contains("filename=\"a&amp;b.mc\""));
     }
 }

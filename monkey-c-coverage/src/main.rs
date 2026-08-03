@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use monkey_c_coverage::{
-    FunctionSite, instrument, manifest_line, parse_hits, parse_manifest_line, runtime_module,
+    FunctionSite, cobertura_report, instrument, manifest_line, parse_hits, parse_manifest_line,
+    runtime_module,
 };
 use monkey_c_diagnostics::{already_reported, read_source, render_parse_error};
 
@@ -43,6 +44,10 @@ enum Command {
         /// pass e.g. "Test.mc" so test code does not count itself.
         #[arg(long)]
         exclude_suffix: Option<String>,
+        /// Also write a Cobertura XML report to this path, for consumers
+        /// like GitHub code quality or codecov.
+        #[arg(long)]
+        cobertura: Option<PathBuf>,
     },
 }
 
@@ -69,7 +74,13 @@ fn run(command: &Command) -> io::Result<()> {
             manifest,
             log,
             exclude_suffix,
-        } => run_report(manifest, log, exclude_suffix.as_deref()),
+            cobertura,
+        } => run_report(
+            manifest,
+            log,
+            exclude_suffix.as_deref(),
+            cobertura.as_deref(),
+        ),
     }
 }
 
@@ -165,7 +176,12 @@ fn walk_dir(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
     Ok(())
 }
 
-fn run_report(manifest: &Path, log: &Path, exclude_suffix: Option<&str>) -> io::Result<()> {
+fn run_report(
+    manifest: &Path,
+    log: &Path,
+    exclude_suffix: Option<&str>,
+    cobertura: Option<&Path>,
+) -> io::Result<()> {
     let sites: Vec<FunctionSite> = read_source(manifest)?
         .lines()
         .filter(|line| !line.is_empty())
@@ -228,6 +244,17 @@ fn run_report(manifest: &Path, log: &Path, exclude_suffix: Option<&str>) -> io::
             io::ErrorKind::InvalidData,
             "no coverage hits in the log — did the instrumented build run and was its output captured?",
         ));
+    }
+
+    if let Some(path) = cobertura {
+        // The XML respects --exclude-suffix, so thresholds enforced on it
+        // match the table above.
+        let filtered: Vec<FunctionSite> = by_file
+            .values()
+            .flat_map(|file_sites| file_sites.iter().map(|site| (*site).clone()))
+            .collect();
+        write(path, &cobertura_report(&filtered, &hits))?;
+        eprintln!("wrote Cobertura report to {}", path.display());
     }
 
     Ok(())
