@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 use comfy_table::Table;
 use monkey_c_coverage::{
-    FunctionSite, coverage_jungle, instrument, manifest_line, parse_hits, parse_manifest_line,
-    runtime_module,
+    FunctionSite, cobertura_report, coverage_jungle, instrument, manifest_line, parse_hits,
+    parse_manifest_line, runtime_module,
 };
 use monkey_c_diagnostics::{already_reported, read_source, read_stdin_source, render_parse_error};
 
@@ -57,6 +57,10 @@ enum Command {
         /// monkeydo -t). Pass `-` to read from stdin, e.g.
         /// `monkeydo … -t | monkey-c-coverage report -`.
         log: PathBuf,
+        /// Also write a Cobertura XML report to this path, for consumers
+        /// like GitHub code quality or codecov.
+        #[arg(long)]
+        cobertura: Option<PathBuf>,
     },
     /// Instrument, build, run under the simulator, and report in one step.
     Test {
@@ -98,6 +102,10 @@ enum Command {
         /// Only used with `--start-simulator`.
         #[arg(long, default_value_t = 5)]
         simulator_boot_time: u64,
+        /// Also write a Cobertura XML report to this path, for consumers
+        /// like GitHub code quality or codecov.
+        #[arg(long)]
+        cobertura: Option<PathBuf>,
         /// Monkey C source files or directories to instrument. Defaults to
         /// the whole project (the nearest ancestor holding `manifest.xml`),
         /// so the tool can be run from any subdirectory of it.
@@ -133,7 +141,11 @@ fn run(command: &Command) -> io::Result<()> {
             jungle,
             files,
         } => run_instrument(out.as_deref(), exclude_annotation, jungle.as_deref(), files).map(drop),
-        Command::Report { dir, log } => run_report(dir.as_deref(), log),
+        Command::Report {
+            dir,
+            log,
+            cobertura,
+        } => run_report(dir.as_deref(), log, cobertura.as_deref()),
         Command::Test {
             device,
             key,
@@ -143,6 +155,7 @@ fn run(command: &Command) -> io::Result<()> {
             dry_run,
             start_simulator,
             simulator_boot_time,
+            cobertura,
             files,
             monkeyc_args,
         } => run_test(&TestOptions {
@@ -156,6 +169,7 @@ fn run(command: &Command) -> io::Result<()> {
             dry_run: *dry_run,
             start_simulator: *start_simulator,
             simulator_boot_time: *simulator_boot_time,
+            cobertura: cobertura.as_deref(),
         }),
     }
 }
@@ -173,6 +187,7 @@ struct TestOptions<'a> {
     dry_run: bool,
     start_simulator: bool,
     simulator_boot_time: u64,
+    cobertura: Option<&'a Path>,
 }
 
 /// Instrument, compile, run under the simulator, and report — see
@@ -277,7 +292,7 @@ fn run_test(options: &TestOptions) -> io::Result<()> {
 
     fs::write(&log_path, &monkeydo_output.stdout)?;
 
-    run_report(Some(&out), &log_path)?;
+    run_report(Some(&out), &log_path, options.cobertura)?;
 
     if failed {
         // Already shown via `print_captured` above.
@@ -541,7 +556,7 @@ fn walk_dir(dir: &Path, exclude_dir: &Path, out: &mut Vec<PathBuf>) -> io::Resul
     Ok(())
 }
 
-fn run_report(dir: Option<&Path>, log: &Path) -> io::Result<()> {
+fn run_report(dir: Option<&Path>, log: &Path, cobertura: Option<&Path>) -> io::Result<()> {
     let dir = match dir {
         Some(dir) => dir.to_path_buf(),
         None => project_root()?.join("bin/coverage"),
@@ -621,6 +636,11 @@ fn run_report(dir: Option<&Path>, log: &Path) -> io::Result<()> {
             io::ErrorKind::InvalidData,
             "no coverage hits in the log — did the instrumented build run and was its output captured?",
         ));
+    }
+
+    if let Some(path) = cobertura {
+        write(path, &cobertura_report(&sites, &hits))?;
+        eprintln!("wrote Cobertura report to {}", path.display());
     }
 
     Ok(())
