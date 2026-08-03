@@ -274,6 +274,11 @@ pub struct CoverageReportArgs {
     /// Defaults to `{repo_root}/bin/coverage`.
     #[arg(long)]
     pub dir: Option<PathBuf>,
+
+    /// Also write a Cobertura XML report to this path, for consumers like
+    /// GitHub code quality or codecov.
+    #[arg(long)]
+    pub cobertura: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -327,6 +332,11 @@ pub struct CoverageTestArgs {
     /// used with `--start-simulator`.
     #[arg(long, default_value_t = 5)]
     pub simulator_boot_time: u64,
+
+    /// Also write a Cobertura XML report to this path, for consumers like
+    /// GitHub code quality or codecov.
+    #[arg(long)]
+    pub cobertura: Option<PathBuf>,
 
     /// Extra arguments forwarded to `monkeyc` verbatim, after `--`, e.g.
     /// `-- -O 3 -w`.

@@ -130,15 +130,23 @@ resources currently needs to fix those up by hand.
 
 ### `report`
 
-| Argument | Default               | Meaning                                          |
-| -------- | --------------------- | ------------------------------------------------ |
-| `<LOG>`  | required              | Captured simulator log; `-` reads it from stdin. |
-| `--dir`  | `{root}/bin/coverage` | Directory holding `coverage-manifest.tsv`.       |
+| Argument      | Default               | Meaning                                              |
+| ------------- | --------------------- | ---------------------------------------------------- |
+| `<LOG>`       | required              | Captured simulator log; `-` reads it from stdin.     |
+| `--dir`       | `{root}/bin/coverage` | Directory holding `coverage-manifest.tsv`.           |
+| `--cobertura` | off                   | Also write a Cobertura XML report to the given path. |
 
 The simulator may reinitialize module state between unit tests, so probe ids
 can repeat in the log; `report` deduplicates while joining. Only lines that
 are exactly `COVHIT <id>` are counted — anything else the simulator
 interleaves is ignored.
+
+The Cobertura XML expresses function granularity in Cobertura's line
+vocabulary: each function contributes exactly one `<line>` at its body's
+opening brace, with `hits` 0 or 1, so a consumer's "line coverage" reads as
+"functions executed". That lets CI systems (GitHub code quality, codecov,
+GitLab) ingest the report and enforce thresholds without pretending line
+data exists.
 
 ### `test`
 
@@ -151,4 +159,5 @@ Takes every `instrument` flag above plus:
 | `--start-simulator`     | off      | Launch `connectiq` and retry once if the first `monkeydo` attempt has no hits.    |
 | `--simulator-boot-time` | `5`      | Seconds to wait after launching the simulator before retrying.                    |
 | `--dry-run`             | off      | Print the `monkeyc`/`monkeydo` commands instead of running them.                  |
+| `--cobertura`           | off      | Also write a Cobertura XML report to the given path.                              |
 | `-- <MONKEYC_ARGS>...`  | none     | Extra arguments forwarded to `monkeyc` verbatim, e.g. `-- -O 3 -w`.               |

@@ -16,8 +16,8 @@
 use comfy_table::Table;
 use monkey_c_config::FilesSettings;
 use monkey_c_coverage::{
-    FunctionSite, coverage_jungle, instrument, manifest_line, parse_hits, parse_manifest_line,
-    runtime_module,
+    FunctionSite, cobertura_report, coverage_jungle, instrument, manifest_line, parse_hits,
+    parse_manifest_line, runtime_module,
 };
 
 use std::collections::{BTreeMap, HashSet};
@@ -39,9 +39,13 @@ pub fn run(global: &GlobalArgs, command: &CoverageCommand) -> io::Result<bool> {
 
     match command {
         CoverageCommand::Instrument(args) => run_instrument(&renderer, args).map(|_| true),
-        CoverageCommand::Report(args) => {
-            run_report(&renderer, args.dir.as_deref(), &args.log).map(|_| true)
-        }
+        CoverageCommand::Report(args) => run_report(
+            &renderer,
+            args.dir.as_deref(),
+            &args.log,
+            args.cobertura.as_deref(),
+        )
+        .map(|_| true),
         CoverageCommand::Test(args) => run_test(&renderer, args),
     }
 }
@@ -152,7 +156,7 @@ fn run_test(renderer: &Renderer, args: &CoverageTestArgs) -> io::Result<bool> {
 
     fs::write(&log_path, &monkeydo_output.stdout)?;
 
-    run_report(renderer, Some(&out), &log_path)?;
+    run_report(renderer, Some(&out), &log_path, args.cobertura.as_deref())?;
 
     // A failing test is a finding, not a broken invocation — it is already
     // printed above, so the command only needs to report "not clean" here.
@@ -377,7 +381,12 @@ fn collect_mc_files(root: &Path, paths: &[PathBuf]) -> io::Result<Vec<PathBuf>> 
     Ok(files)
 }
 
-fn run_report(renderer: &Renderer, dir: Option<&Path>, log: &Path) -> io::Result<()> {
+fn run_report(
+    renderer: &Renderer,
+    dir: Option<&Path>,
+    log: &Path,
+    cobertura: Option<&Path>,
+) -> io::Result<()> {
     let dir = match dir {
         Some(dir) => dir.to_path_buf(),
         None => project_root()?.join("bin/coverage"),
@@ -459,6 +468,11 @@ fn run_report(renderer: &Renderer, dir: Option<&Path>, log: &Path) -> io::Result
             io::ErrorKind::InvalidData,
             "no coverage hits in the log — did the instrumented build run and was its output captured?",
         ));
+    }
+
+    if let Some(path) = cobertura {
+        write(path, &cobertura_report(&sites, &hits))?;
+        eprintln!("wrote Cobertura report to {}", path.display());
     }
 
     Ok(())
